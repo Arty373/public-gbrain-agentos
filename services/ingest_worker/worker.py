@@ -94,13 +94,22 @@ async def _process_job(
 
     await conn.execute(SQL_UPDATE_STATUS, job_id, "processing")
 
-    chunks = chunk_text(body)
+    chunks = chunk_text(
+        body,
+        window_size=int(os.environ.get("GBRAIN_CHUNK_WORDS", "500")),
+        overlap=int(os.environ.get("GBRAIN_CHUNK_OVERLAP", "50")),
+    )
     if not chunks:
         logger.warning("Job %d: empty body, marking completed", job_id)
         await conn.execute(SQL_UPDATE_STATUS, job_id, "completed")
         return
 
-    embeddings = embedder.embed(chunks)
+    # Optional: prefix each embedded chunk with the document name (stored content stays the raw chunk).
+    if os.environ.get("GBRAIN_EMBED_TITLE") == "1":
+        stem = path.rsplit("/", 1)[-1].removesuffix(".md")
+        embeddings = embedder.embed([f"{stem}. {c}" for c in chunks])
+    else:
+        embeddings = embedder.embed(chunks)
 
     await conn.execute(SQL_DELETE_CHUNKS, doc_id)
 

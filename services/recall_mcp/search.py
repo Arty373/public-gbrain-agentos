@@ -1,6 +1,7 @@
 """MCP tools for recall read-side: recall, recent, related, get, stats, reindex_check."""
 import asyncio
 import os
+import re
 import hashlib
 import logging
 from contextvars import ContextVar
@@ -218,6 +219,14 @@ async def _fts_search(
     """
     if not query_text or not query_text.strip():
         return []
+
+    if os.environ.get("GBRAIN_FTS_MODE") == "or":
+        # Natural-language questions rarely match ALL words; OR + ts_rank_cd ranks docs
+        # that contain more of the terms higher.
+        terms = re.findall(r"[\w.]+", query_text)
+        terms = [t.strip(".") for t in terms if len(t.strip(".")) >= 2]
+        if terms:
+            query_text = " or ".join(terms)
 
     params: list[Any] = [query_text]
     params.extend(extra_params)
@@ -545,6 +554,16 @@ def register_tools(
             })
 
         scored.sort(key=lambda x: x["score"], reverse=True)
+        if os.environ.get("GBRAIN_DEDUP_DOCS") == "1":
+            # One result per document (its best chunk), so a long doc cannot fill the top-K.
+            seen_docs: set[int] = set()
+            deduped: list[dict[str, Any]] = []
+            for item in scored:
+                if item["_doc_id"] in seen_docs:
+                    continue
+                seen_docs.add(item["_doc_id"])
+                deduped.append(item)
+            scored = deduped
         results = _diversify_by_scope(scored, limit, diversify_max)
 
         # Cross-link expansion (1-hop)
@@ -555,6 +574,8 @@ def register_tools(
 
         if all_links:
             adjacent = await expand_links(pool, all_links, existing_ids)
+            # Cross-links must not bypass the reader's read scopes.
+            adjacent = [a for a in adjacent if check_read_scope(agent_ctx, a.get("scope", ""))]
             results.extend(adjacent)
 
         # Clean internal fields
