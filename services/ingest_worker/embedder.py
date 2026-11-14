@@ -9,7 +9,10 @@ from services.shared.embedding import as_passage, load_text_embedding
 
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 32
+import os
+
+# ONNX batch size; activations grow with it (32 x 512 tokens needs > 2 GB on e5-base).
+BATCH_SIZE = int(os.environ.get("GBRAIN_EMBED_BATCH", "32"))
 CACHE_MAX_SIZE = 512
 
 
