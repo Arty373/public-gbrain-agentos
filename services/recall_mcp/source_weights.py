@@ -8,6 +8,7 @@ SOURCE_WEIGHTS: dict[str, float] = {
     "project": 1.2,
     "external": 1.0,
     "knowledge": 1.0,
+    "private": 1.0,  # ru-install: agent private area (40-<agent>)
     "daily": 0.0,  # excluded from semantic search
 }
 

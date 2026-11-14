@@ -30,7 +30,7 @@ from services.shared.config import Config, _env_float_clamped
 from services.shared.tool_gating import should_register_tool
 
 from .jaccard import find_supersession_candidates, tokenize
-from .path_guard import validate_path
+from .path_guard import private_areas, validate_path
 
 logger = logging.getLogger(__name__)
 
@@ -1228,6 +1228,71 @@ def register_tools(
             pool, agent_ctx.agent, "create_handoff",
             {"from": from_agent, "to": to_agent, "path": rel_path},
             "ok", int((time.monotonic() - t0) * 1000),
+        )
+        return f"created: {rel_path}"
+
+    # ------------------------------------------------------------------
+    # 5a. create_private_note (ru-install: agent's own isolated area)
+    # ------------------------------------------------------------------
+    @gated_tool("create_private_note", annotations={"readOnlyHint": False})
+    async def create_private_note(
+        title: str,
+        body: str,
+        tags: list[str] | None = None,
+        ctx: dict[str, object] | None = None,
+    ) -> str:
+        """Create a note in the caller's own private area (e.g. 40-anna/).
+
+        Only for agents listed in GBRAIN_PRIVATE_AREAS. Other agents cannot
+        read that area (enforced by their token read scopes).
+        """
+        t0 = time.monotonic()
+        pool: asyncpg.Pool = await get_pool_fn()  # type: ignore[misc]
+        agent_ctx = await _authenticate_request(ctx, pool)
+        scope = private_areas().get(agent_ctx.agent)
+        if scope is None:
+            raise PermissionError(
+                f"Agent '{agent_ctx.agent}' has no private area"
+            )
+        # Explicit scope only: a '*' write token must not count as owning the area.
+        if scope not in agent_ctx.write_scopes:
+            raise PermissionError(
+                f"Agent '{agent_ctx.agent}' cannot write to {scope}"
+            )
+        if not title or not title.strip():
+            raise ValueError("title must not be empty")
+
+        rel_path, abs_path = await _allocate_note_path(
+            pool, f"{scope}/{_today_iso()}-", title, body, vault_root,
+        )
+        fm = {
+            "type": "private",
+            "created": _now_iso(),
+            "updated": _now_iso(),
+            "agent": agent_ctx.agent,
+            "tags": list(tags or []),
+            "related": [],
+        }
+        content = _build_frontmatter(fm) + f"\n# {title}\n\n{body}\n"
+        content_hash = _sha256(content)
+
+        doc_id, changed = await _upsert_document(
+            pool, rel_path, fm, body, content_hash, "private", agent_ctx.agent,
+        )
+        if not changed:
+            await log_audit(
+                pool, agent_ctx.agent, "create_private_note",
+                {"path": rel_path}, "unchanged", int((time.monotonic() - t0) * 1000),
+            )
+            return f"unchanged: {rel_path}"
+
+        abs_path.parent.mkdir(parents=True, exist_ok=True)
+        abs_path.write_text(content, encoding="utf-8")
+
+        await _queue_embedding(pool, doc_id)
+        await log_audit(
+            pool, agent_ctx.agent, "create_private_note",
+            {"path": rel_path}, "ok", int((time.monotonic() - t0) * 1000),
         )
         return f"created: {rel_path}"
 

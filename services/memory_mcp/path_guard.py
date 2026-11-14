@@ -1,4 +1,5 @@
 """Path safety guard for vault filesystem operations."""
+import os
 from pathlib import Path
 
 ALLOWED_SCOPES = frozenset({
@@ -16,6 +17,31 @@ ALLOWED_SCOPES = frozenset({
     "90-inbox",
     "_templates",
 })
+
+
+def private_areas(raw: str | None = None) -> dict[str, str]:
+    """Parse ``GBRAIN_PRIVATE_AREAS`` ("anna:40-anna,x:40-x") -> {agent: scope}.
+
+    ru-install: an agent's own isolated area. The scope is only writable by
+    that agent's create_private_note; who may READ it is decided solely by
+    ``agent_tokens.can_read_scopes`` (other agents must not list it).
+    """
+    raw = os.environ.get("GBRAIN_PRIVATE_AREAS", "") if raw is None else raw
+    areas: dict[str, str] = {}
+    for item in raw.split(","):
+        agent, sep, scope = item.strip().partition(":")
+        if not sep:
+            continue
+        agent, scope = agent.strip(), scope.strip()
+        if not agent or not scope or "/" in scope or ".." in scope or not scope.startswith("40-"):
+            raise RuntimeError(f"bad GBRAIN_PRIVATE_AREAS item: {item!r}")
+        areas[agent] = scope
+    return areas
+
+
+def allowed_scopes() -> frozenset[str]:
+    """Static scopes plus the configured private areas."""
+    return ALLOWED_SCOPES | frozenset(private_areas().values())
 
 
 def validate_path(path: str, vault_root: str) -> Path:
@@ -45,10 +71,11 @@ def validate_path(path: str, vault_root: str) -> Path:
 
     # Extract top-level scope from the path
     top_level = path.split("/")[0]
-    if top_level not in ALLOWED_SCOPES:
+    scopes = allowed_scopes()
+    if top_level not in scopes:
         raise ValueError(
             f"Unknown scope '{top_level}'. "
-            f"Allowed: {', '.join(sorted(ALLOWED_SCOPES))}"
+            f"Allowed: {', '.join(sorted(scopes))}"
         )
 
     root = Path(vault_root).resolve()
