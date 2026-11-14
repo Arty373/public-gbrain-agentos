@@ -5,6 +5,8 @@ from collections import OrderedDict
 
 from fastembed import TextEmbedding
 
+from services.shared.embedding import as_passage, load_text_embedding
+
 logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 32
@@ -32,7 +34,7 @@ class Embedder:
         """Load model on first use."""
         if self._model is None:
             logger.info("Loading FastEmbed model: %s", self._model_name)
-            self._model = TextEmbedding(model_name=self._model_name)
+            self._model = load_text_embedding(self._model_name)
             logger.info("FastEmbed model loaded")
         return self._model
 
@@ -79,7 +81,7 @@ class Embedder:
             all_embeddings: list[list[float]] = []
             for batch_start in range(0, len(uncached_texts), BATCH_SIZE):
                 batch = uncached_texts[batch_start:batch_start + BATCH_SIZE]
-                batch_results = list(model.embed(batch))
+                batch_results = list(model.embed([as_passage(self._model_name, t) for t in batch]))
                 for vec in batch_results:
                     all_embeddings.append(vec.tolist())
 

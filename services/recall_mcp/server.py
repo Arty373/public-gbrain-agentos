@@ -61,8 +61,8 @@ async def lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
     _pool = await get_pool(config)
 
     logger.info("Loading FastEmbed model: %s", config.fastembed_model)
-    from fastembed import TextEmbedding
-    _embed_model = TextEmbedding(config.fastembed_model)
+    from services.shared.embedding import load_text_embedding
+    _embed_model = load_text_embedding(config.fastembed_model)
 
     logger.info(
         "recall-mcp ready: port=%d embed=%s",

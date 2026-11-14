@@ -1,5 +1,6 @@
 """MCP tools for recall read-side: recall, recent, related, get, stats, reindex_check."""
 import asyncio
+import os
 import hashlib
 import logging
 from contextvars import ContextVar
@@ -11,6 +12,7 @@ import asyncpg
 import numpy as np
 from fastmcp import Context
 
+from services.shared.embedding import as_query
 from services.shared.tool_gating import should_register_tool
 
 from .cache import CacheKey, RecallCache
@@ -496,7 +498,7 @@ def register_tools(
 
         # Embed query
         # FastEmbed.embed is sync/CPU-bound; offload to thread to avoid blocking event loop.
-        embeddings = await asyncio.to_thread(lambda: list(embed_model.embed([query])))
+        embeddings = await asyncio.to_thread(lambda: list(embed_model.embed([as_query(os.environ.get("FASTEMBED_MODEL", ""), query)])))
         vec = embeddings[0].tolist()
 
         # Build filters (param offset 2 because $1 is vec/query)
