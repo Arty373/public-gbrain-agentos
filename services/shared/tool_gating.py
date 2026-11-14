@@ -25,6 +25,7 @@ CORE_TOOLS_BY_SERVER: dict[str, frozenset[str]] = {
         "create_handoff",
         "append_daily_log",
         "supersede_decision",
+        "create_private_note",
     }),
     "recall_mcp": frozenset({
         "recall",

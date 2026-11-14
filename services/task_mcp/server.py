@@ -123,6 +123,39 @@ def _require_write(agent_ctx: AgentContext) -> None:
         )
 
 
+def _allowed_assignees() -> frozenset[str] | None:
+    """ru-install: GBRAIN_TASK_ASSIGNEES="eva,bob,anna" limits assignees; unset = any."""
+    raw = os.environ.get("GBRAIN_TASK_ASSIGNEES", "").strip()
+    if not raw:
+        return None
+    return frozenset(a.strip() for a in raw.split(",") if a.strip())
+
+
+def _validate_assignee(assignee: str | None) -> None:
+    allowed = _allowed_assignees()
+    if allowed is not None and assignee is not None and assignee not in allowed:
+        raise ValueError(
+            f"invalid assignee {assignee!r}, must be one of: {', '.join(sorted(allowed))}"
+        )
+
+
+async def _require_party(pool: asyncpg.Pool, task_id: int, agent_ctx: AgentContext) -> dict[str, Any]:
+    """ru-install: only the creator or the assignee may change a task.
+
+    Disabled when GBRAIN_TASK_PARTY_ONLY=0 (upstream behaviour: any writer).
+    """
+    current = await store.get_task(pool, task_id)
+    if current is None:
+        raise ValueError(f"task {task_id} not found")
+    if os.environ.get("GBRAIN_TASK_PARTY_ONLY", "1") == "0":
+        return current
+    if agent_ctx.agent not in (current["created_by"], current["assignee"]):
+        raise PermissionError(
+            f"Agent {agent_ctx.agent!r} is neither creator nor assignee of task {task_id}"
+        )
+    return current
+
+
 # ---------------------------------------------------------------------------
 # MCP Tools
 # ---------------------------------------------------------------------------
@@ -144,6 +177,7 @@ async def task_create(
     pool = await _get_pool()
     agent_ctx = await _resolve_caller(ctx, pool)
     _require_write(agent_ctx)
+    _validate_assignee(assignee)
     result = await store.create_task(
         pool, agent_ctx.agent, title, description, assignee, priority, metadata,
     )
@@ -163,12 +197,18 @@ async def task_update(
     assignee: str | None = None,
     priority: str | None = None,
     metadata: dict[str, Any] | None = None,
+    metadata_patch: dict[str, Any] | None = None,
     ctx: Any = None,
 ) -> dict[str, Any]:
-    """Update specific fields of a task. Only provided fields are changed."""
+    """Update specific fields of a task. Only provided fields are changed.
+
+    ``metadata`` replaces the whole object; ``metadata_patch`` merges top-level keys.
+    """
     pool = await _get_pool()
     agent_ctx = await _resolve_caller(ctx, pool)
     _require_write(agent_ctx)
+    _validate_assignee(assignee)
+    await _require_party(pool, task_id, agent_ctx)
     result = await store.update_task(
         pool, task_id, agent_ctx.agent,
         title=title,
@@ -176,6 +216,7 @@ async def task_update(
         assignee=assignee,
         priority=priority,
         metadata=metadata,
+        metadata_patch=metadata_patch,
     )
     await log_audit(
         pool, agent_ctx.agent, "task_update",
@@ -183,7 +224,7 @@ async def task_update(
             k for k, v in {
                 "title": title, "description": description,
                 "assignee": assignee, "priority": priority,
-                "metadata": metadata,
+                "metadata": metadata, "metadata_patch": metadata_patch,
             }.items() if v is not None
         ]},
         "ok", 0,
@@ -207,13 +248,23 @@ async def task_list(
     assignee: str | None = None,
     status: str | None = None,
     limit: int = 50,
+    created_by: str | None = None,
+    updated_since: str | None = None,
+    involving: str | None = None,
     ctx: Any = None,
 ) -> list[dict[str, Any]]:
-    """List tasks with optional filters by assignee and/or status."""
+    """List tasks with optional filters.
+
+    assignee / status / created_by; ``involving`` = assignee OR creator;
+    ``updated_since`` = ISO 8601 with offset (then newest-updated first).
+    """
     pool = await _get_pool()
     await _resolve_caller(ctx, pool)
     clamped_limit = max(1, min(limit, 500))
-    return await store.list_tasks(pool, assignee, status, clamped_limit)
+    return await store.list_tasks(
+        pool, assignee, status, clamped_limit,
+        created_by=created_by, updated_since=updated_since, involving=involving,
+    )
 
 
 @_gated_tool("task_start")
@@ -226,6 +277,7 @@ async def task_start(
     pool = await _get_pool()
     agent_ctx = await _resolve_caller(ctx, pool)
     _require_write(agent_ctx)
+    await _require_party(pool, task_id, agent_ctx)
     result = await store.transition_status(pool, task_id, agent_ctx.agent, "progress", note)
     await log_audit(
         pool, agent_ctx.agent, "task_start",
@@ -245,6 +297,7 @@ async def task_review(
     pool = await _get_pool()
     agent_ctx = await _resolve_caller(ctx, pool)
     _require_write(agent_ctx)
+    await _require_party(pool, task_id, agent_ctx)
     result = await store.transition_status(pool, task_id, agent_ctx.agent, "review", note)
     await log_audit(
         pool, agent_ctx.agent, "task_review",
@@ -264,6 +317,7 @@ async def task_done(
     pool = await _get_pool()
     agent_ctx = await _resolve_caller(ctx, pool)
     _require_write(agent_ctx)
+    await _require_party(pool, task_id, agent_ctx)
     result = await store.transition_status(pool, task_id, agent_ctx.agent, "done", note)
     await log_audit(
         pool, agent_ctx.agent, "task_done",
@@ -283,6 +337,7 @@ async def task_block(
     pool = await _get_pool()
     agent_ctx = await _resolve_caller(ctx, pool)
     _require_write(agent_ctx)
+    await _require_party(pool, task_id, agent_ctx)
     result = await store.transition_status(pool, task_id, agent_ctx.agent, "blocked", reason)
     await log_audit(
         pool, agent_ctx.agent, "task_block",
@@ -308,10 +363,8 @@ async def task_reopen(
     agent_ctx = await _resolve_caller(ctx, pool)
     _require_write(agent_ctx)
 
-    # Read current status to determine transition target
-    current = await store.get_task(pool, task_id)
-    if current is None:
-        raise ValueError(f"task {task_id} not found")
+    # Read current status to determine transition target (creator/assignee only)
+    current = await _require_party(pool, task_id, agent_ctx)
 
     target_map = {"blocked": "new", "review": "progress"}
     current_status = current["status"]

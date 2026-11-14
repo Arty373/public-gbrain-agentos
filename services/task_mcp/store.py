@@ -162,8 +162,10 @@ async def update_task(
     Raises:
         ValueError: If no valid fields provided, task not found, or invalid values.
     """
-    allowed_fields = {"title", "description", "assignee", "priority", "metadata"}
+    allowed_fields = {"title", "description", "assignee", "priority", "metadata", "metadata_patch"}
     updates = {k: v for k, v in fields.items() if k in allowed_fields and v is not None}
+    if "metadata" in updates and "metadata_patch" in updates:
+        raise ValueError("pass either metadata or metadata_patch, not both")
 
     if not updates:
         raise ValueError("no valid fields to update")
@@ -187,6 +189,10 @@ async def update_task(
     for field_name, value in updates.items():
         if field_name == "metadata":
             set_parts.append(f"metadata = ${param_idx}::jsonb")
+            params.append(_json_dumps(value))
+        elif field_name == "metadata_patch":
+            # ru-install: shallow merge of top-level keys, atomic in one UPDATE
+            set_parts.append(f"metadata = metadata || ${param_idx}::jsonb")
             params.append(_json_dumps(value))
         else:
             set_parts.append(f"{field_name} = ${param_idx}")
@@ -246,6 +252,9 @@ async def list_tasks(
     assignee: str | None = None,
     status: str | None = None,
     limit: int = 50,
+    created_by: str | None = None,
+    updated_since: str | None = None,
+    involving: str | None = None,
 ) -> list[dict[str, Any]]:
     """List tasks with optional filters.
 
@@ -281,6 +290,29 @@ async def list_tasks(
         params.append(status)
         param_idx += 1
 
+    # ru-install filters: creator, "assignee or creator", changed since (ISO 8601)
+    if created_by is not None:
+        conditions.append(f"created_by = ${param_idx}")
+        params.append(created_by)
+        param_idx += 1
+
+    if involving is not None:
+        conditions.append(f"(assignee = ${param_idx} OR created_by = ${param_idx})")
+        params.append(involving)
+        param_idx += 1
+
+    if updated_since is not None:
+        from datetime import datetime
+        try:
+            since = datetime.fromisoformat(updated_since)
+        except ValueError as exc:
+            raise ValueError(f"invalid updated_since {updated_since!r}: {exc}") from exc
+        if since.tzinfo is None:
+            raise ValueError("updated_since must carry a timezone offset")
+        conditions.append(f"updated_at > ${param_idx}")
+        params.append(since)
+        param_idx += 1
+
     params.append(limit)
 
     where_clause = ""
@@ -293,7 +325,7 @@ async def list_tasks(
                metadata::text AS metadata_json
         FROM tasks
         {where_clause}
-        ORDER BY created_at DESC
+        ORDER BY {"updated_at" if updated_since is not None else "created_at"} DESC
         LIMIT ${param_idx}
     """
 
