@@ -117,7 +117,8 @@ async def create_task(
             f"{', '.join(sorted(VALID_PRIORITIES))}"
         )
 
-    meta_json = _json_dumps(metadata or {})
+    # ru-install: last_actor is always the authenticated agent (clients cannot set it)
+    meta_json = _json_dumps(dict(metadata or {}, last_actor=agent))
     row = await pool.fetchrow(
         """
         INSERT INTO tasks
@@ -145,6 +146,7 @@ async def update_task(
     pool: asyncpg.Pool,
     task_id: int,
     agent: str,
+    party: str | None = None,
     **fields: Any,
 ) -> dict[str, Any]:
     """Update specific fields of a task. Only provided fields are changed.
@@ -189,23 +191,32 @@ async def update_task(
     for field_name, value in updates.items():
         if field_name == "metadata":
             set_parts.append(f"metadata = ${param_idx}::jsonb")
-            params.append(_json_dumps(value))
+            params.append(_json_dumps(dict(value, last_actor=agent)))
         elif field_name == "metadata_patch":
             # ru-install: shallow merge of top-level keys, atomic in one UPDATE
             set_parts.append(f"metadata = metadata || ${param_idx}::jsonb")
-            params.append(_json_dumps(value))
+            params.append(_json_dumps(dict(value, last_actor=agent)))
         else:
             set_parts.append(f"{field_name} = ${param_idx}")
             params.append(value)
         param_idx += 1
 
+    if "metadata" not in updates and "metadata_patch" not in updates:
+        set_parts.append(f"metadata = metadata || ${param_idx}::jsonb")
+        params.append(_json_dumps({"last_actor": agent}))
+        param_idx += 1
     set_parts.append("updated_at = now()")
     params.append(task_id)
+    party_clause = ""
+    if party is not None:
+        # ru-install: authorization in the same statement (no check-then-update race)
+        params.append(party)
+        party_clause = f" AND (created_by = ${param_idx + 1} OR assignee = ${param_idx + 1})"
 
     query = f"""
         UPDATE tasks
         SET {', '.join(set_parts)}
-        WHERE id = ${param_idx}
+        WHERE id = ${param_idx}{party_clause}
         RETURNING id, title, description, status, assignee, priority,
                   created_by, created_at, updated_at,
                   metadata::text AS metadata_json
@@ -213,6 +224,8 @@ async def update_task(
 
     row = await pool.fetchrow(query, *params)
     if row is None:
+        if party is not None and await get_task(pool, task_id) is not None:
+            raise PermissionError(f"Agent {party!r} is neither creator nor assignee of task {task_id}")
         raise ValueError(f"task {task_id} not found")
 
     logger.info(
@@ -255,6 +268,7 @@ async def list_tasks(
     created_by: str | None = None,
     updated_since: str | None = None,
     involving: str | None = None,
+    open_only: bool = False,
 ) -> list[dict[str, Any]]:
     """List tasks with optional filters.
 
@@ -301,6 +315,9 @@ async def list_tasks(
         params.append(involving)
         param_idx += 1
 
+    if open_only:
+        conditions.append("status <> 'done'")
+
     if updated_since is not None:
         from datetime import datetime
         try:
@@ -339,6 +356,7 @@ async def transition_status(
     agent: str,
     new_status: str,
     note: str | None = None,
+    party: str | None = None,
 ) -> dict[str, Any]:
     """Transition a task to a new status following the state machine.
 
@@ -369,7 +387,7 @@ async def transition_status(
             # Lock the row to prevent concurrent transitions
             row = await conn.fetchrow(
                 """
-                SELECT id, status
+                SELECT id, status, created_by, assignee
                 FROM tasks
                 WHERE id = $1
                 FOR UPDATE
@@ -378,6 +396,11 @@ async def transition_status(
             )
             if row is None:
                 raise ValueError(f"task {task_id} not found")
+            # ru-install: authorization under the row lock
+            if party is not None and party not in (row["created_by"], row["assignee"]):
+                raise PermissionError(
+                    f"Agent {party!r} is neither creator nor assignee of task {task_id}"
+                )
 
             old_status = row["status"]
             allowed = VALID_TRANSITIONS.get(old_status, frozenset())
@@ -392,7 +415,8 @@ async def transition_status(
             updated = await conn.fetchrow(
                 """
                 UPDATE tasks
-                SET status = $1, updated_at = now()
+                SET status = $1, updated_at = now(),
+                    metadata = metadata || jsonb_build_object('last_actor', $3::text)
                 WHERE id = $2
                 RETURNING id, title, description, status, assignee, priority,
                           created_by, created_at, updated_at,
@@ -400,6 +424,7 @@ async def transition_status(
                 """,
                 new_status,
                 task_id,
+                agent,
             )
 
             # Insert history record

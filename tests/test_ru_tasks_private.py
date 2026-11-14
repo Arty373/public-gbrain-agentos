@@ -155,3 +155,98 @@ async def test_metadata_patch_merges():
     assert "metadata = metadata || $1::jsonb" in pool.query
     with pytest.raises(ValueError):
         await task_store.update_task(pool, 1, "anna", metadata={}, metadata_patch={"a": 1})
+
+
+class _RecPool(_UpdPool):
+    def __init__(self, existing=None):
+        super().__init__()
+        self.params = ()
+        self.existing = existing
+
+    async def fetchrow(self, query, *params):
+        if query.lstrip().startswith("SELECT"):
+            return self.existing
+        self.query, self.params = query, params
+        return None
+
+
+@pytest.mark.asyncio
+async def test_update_checks_party_in_the_same_statement_and_sets_last_actor():
+    import json as _json
+
+    existing = {"id": 1, "title": "t", "description": "", "status": "new", "assignee": "anna", "priority": "medium",
+                "created_by": "eva", "created_at": datetime.now(timezone.utc), "updated_at": datetime.now(timezone.utc),
+                "metadata_json": "{}"}
+    pool = _RecPool(existing)
+    with pytest.raises(PermissionError):  # row exists but the party predicate did not match
+        await task_store.update_task(pool, 1, "bob", party="bob", metadata_patch={"last_actor": "anna", "x": 1})
+    assert "AND (created_by = $3 OR assignee = $3)" in pool.query
+    assert _json.loads(pool.params[0]) == {"last_actor": "bob", "x": 1}  # client cannot forge last_actor
+    pool = _RecPool(None)
+    with pytest.raises(ValueError):
+        await task_store.update_task(pool, 1, "eva", party="eva", title="new")
+    assert "metadata = metadata || $2::jsonb" in pool.query and "$4" in pool.query
+
+
+class _TxConn:
+    def __init__(self, row):
+        self.row, self.executed = row, []
+
+    def transaction(self):
+        conn = self
+
+        class _Tx:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *a):
+                return False
+        return _Tx()
+
+    async def fetchrow(self, query, *params):
+        if "FOR UPDATE" in query:
+            return self.row
+        self.executed.append((query, params))
+        now = datetime.now(timezone.utc)
+        return {"id": 1, "title": "t", "description": "", "status": params[0], "assignee": "anna",
+                "priority": "medium", "created_by": "eva", "created_at": now, "updated_at": now,
+                "metadata_json": "{}"}
+
+    async def execute(self, query, *params):
+        self.executed.append((query, params))
+
+
+class _TxPool:
+    def __init__(self, row):
+        self.conn = _TxConn(row)
+
+    def acquire(self):
+        conn = self.conn
+
+        class _Acq:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *a):
+                return False
+        return _Acq()
+
+
+@pytest.mark.asyncio
+async def test_transition_checks_party_under_row_lock():
+    row = {"id": 1, "status": "new", "created_by": "eva", "assignee": "anna"}
+    pool = _TxPool(row)
+    with pytest.raises(PermissionError):
+        await task_store.transition_status(pool, 1, "bob", "progress", party="bob")
+    assert pool.conn.executed == []
+    out = await task_store.transition_status(pool, 1, "anna", "progress", party="anna")
+    assert out["status"] == "progress"
+    update_sql, update_params = pool.conn.executed[0]
+    assert "jsonb_build_object('last_actor', $3::text)" in update_sql and update_params[2] == "anna"
+
+
+@pytest.mark.asyncio
+async def test_list_open_only_before_limit():
+    pool = _ListPool()
+    await task_store.list_tasks(pool, assignee="anna", open_only=True, limit=3)
+    assert "status <> 'done'" in pool.query

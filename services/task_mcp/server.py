@@ -139,9 +139,15 @@ def _validate_assignee(assignee: str | None) -> None:
         )
 
 
-async def _require_party(pool: asyncpg.Pool, task_id: int, agent_ctx: AgentContext) -> dict[str, Any]:
-    """ru-install: only the creator or the assignee may change a task.
+def _party(agent_ctx: AgentContext) -> str | None:
+    """Agent name the store must match against creator/assignee (None = upstream: any writer)."""
+    return None if os.environ.get("GBRAIN_TASK_PARTY_ONLY", "1") == "0" else agent_ctx.agent
 
+
+async def _require_party(pool: asyncpg.Pool, task_id: int, agent_ctx: AgentContext) -> dict[str, Any]:
+    """ru-install: only the creator or the assignee may change a task (early, readable error).
+
+    The binding check runs again inside the store's UPDATE / row lock (``party=``).
     Disabled when GBRAIN_TASK_PARTY_ONLY=0 (upstream behaviour: any writer).
     """
     current = await store.get_task(pool, task_id)
@@ -217,6 +223,7 @@ async def task_update(
         priority=priority,
         metadata=metadata,
         metadata_patch=metadata_patch,
+        party=_party(agent_ctx),
     )
     await log_audit(
         pool, agent_ctx.agent, "task_update",
@@ -251,12 +258,14 @@ async def task_list(
     created_by: str | None = None,
     updated_since: str | None = None,
     involving: str | None = None,
+    open_only: bool = False,
     ctx: Any = None,
 ) -> list[dict[str, Any]]:
     """List tasks with optional filters.
 
     assignee / status / created_by; ``involving`` = assignee OR creator;
-    ``updated_since`` = ISO 8601 with offset (then newest-updated first).
+    ``updated_since`` = ISO 8601 with offset (then newest-updated first);
+    ``open_only`` = everything except done (applied before the limit).
     """
     pool = await _get_pool()
     await _resolve_caller(ctx, pool)
@@ -264,6 +273,7 @@ async def task_list(
     return await store.list_tasks(
         pool, assignee, status, clamped_limit,
         created_by=created_by, updated_since=updated_since, involving=involving,
+        open_only=open_only,
     )
 
 
@@ -278,7 +288,7 @@ async def task_start(
     agent_ctx = await _resolve_caller(ctx, pool)
     _require_write(agent_ctx)
     await _require_party(pool, task_id, agent_ctx)
-    result = await store.transition_status(pool, task_id, agent_ctx.agent, "progress", note)
+    result = await store.transition_status(pool, task_id, agent_ctx.agent, "progress", note, party=_party(agent_ctx))
     await log_audit(
         pool, agent_ctx.agent, "task_start",
         {"task_id": task_id, "note": note},
@@ -298,7 +308,7 @@ async def task_review(
     agent_ctx = await _resolve_caller(ctx, pool)
     _require_write(agent_ctx)
     await _require_party(pool, task_id, agent_ctx)
-    result = await store.transition_status(pool, task_id, agent_ctx.agent, "review", note)
+    result = await store.transition_status(pool, task_id, agent_ctx.agent, "review", note, party=_party(agent_ctx))
     await log_audit(
         pool, agent_ctx.agent, "task_review",
         {"task_id": task_id, "note": note},
@@ -318,7 +328,7 @@ async def task_done(
     agent_ctx = await _resolve_caller(ctx, pool)
     _require_write(agent_ctx)
     await _require_party(pool, task_id, agent_ctx)
-    result = await store.transition_status(pool, task_id, agent_ctx.agent, "done", note)
+    result = await store.transition_status(pool, task_id, agent_ctx.agent, "done", note, party=_party(agent_ctx))
     await log_audit(
         pool, agent_ctx.agent, "task_done",
         {"task_id": task_id, "note": note},
@@ -338,7 +348,7 @@ async def task_block(
     agent_ctx = await _resolve_caller(ctx, pool)
     _require_write(agent_ctx)
     await _require_party(pool, task_id, agent_ctx)
-    result = await store.transition_status(pool, task_id, agent_ctx.agent, "blocked", reason)
+    result = await store.transition_status(pool, task_id, agent_ctx.agent, "blocked", reason, party=_party(agent_ctx))
     await log_audit(
         pool, agent_ctx.agent, "task_block",
         {"task_id": task_id, "reason": reason},
@@ -375,7 +385,7 @@ async def task_reopen(
             f"Valid source statuses: blocked, review"
         )
 
-    result = await store.transition_status(pool, task_id, agent_ctx.agent, target, note)
+    result = await store.transition_status(pool, task_id, agent_ctx.agent, target, note, party=_party(agent_ctx))
     await log_audit(
         pool, agent_ctx.agent, "task_reopen",
         {"task_id": task_id, "from": current_status, "to": target, "note": note},
