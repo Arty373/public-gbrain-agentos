@@ -6,6 +6,7 @@ trained with.
 """
 from __future__ import annotations
 
+import os
 from typing import Any
 
 E5_BASE = "intfloat/multilingual-e5-base"
@@ -23,6 +24,10 @@ def load_text_embedding(model_name: str) -> Any:
                 model=E5_BASE, pooling=PoolingType.MEAN, normalization=True,
                 sources=ModelSource(hf=E5_BASE), dim=768, model_file="onnx/model.onnx",
             )
+    threads = os.environ.get("FASTEMBED_THREADS")
+    if threads:
+        # ONNX Runtime otherwise starts one thread per visible core, which thrashes under a CPU quota.
+        return TextEmbedding(model_name=model_name, threads=int(threads))
     return TextEmbedding(model_name=model_name)
 
 
